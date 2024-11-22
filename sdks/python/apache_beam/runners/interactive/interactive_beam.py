@@ -36,7 +36,9 @@ this module in your notebook or application code.
 
 import logging
 from datetime import timedelta
+from typing import Any
 from typing import Dict
+from typing import Iterable
 from typing import List
 from typing import Optional
 from typing import Union
@@ -46,6 +48,7 @@ import pandas as pd
 import apache_beam as beam
 from apache_beam.dataframe.frame_base import DeferredBase
 from apache_beam.options.pipeline_options import FlinkRunnerOptions
+from apache_beam.pvalue import PCollection
 from apache_beam.runners.interactive import interactive_environment as ie
 from apache_beam.runners.interactive.dataproc.dataproc_cluster_manager import DataprocClusterManager
 from apache_beam.runners.interactive.dataproc.types import ClusterIdentifier
@@ -270,9 +273,9 @@ class Recordings():
   from all defined unbounded sources for that PCollection's pipeline. The
   following methods allow for introspection into that background recording job.
   """
-  def describe(self, pipeline=None):
-    # type: (Optional[beam.Pipeline]) -> dict[str, Any] # noqa: F821
-
+  def describe(
+      self,
+      pipeline: Optional[beam.Pipeline] = None) -> Dict[str, Any]:  # noqa: F821
     """Returns a description of all the recordings for the given pipeline.
 
     If no pipeline is given then this returns a dictionary of descriptions for
@@ -289,9 +292,7 @@ class Recordings():
       return description[pipeline]
     return description
 
-  def clear(self, pipeline):
-    # type: (beam.Pipeline) -> bool
-
+  def clear(self, pipeline: beam.Pipeline) -> bool:
     """Clears all recordings of the given pipeline. Returns True if cleared."""
 
     description = self.describe(pipeline)
@@ -305,18 +306,14 @@ class Recordings():
     ie.current_env().cleanup(pipeline)
     return True
 
-  def stop(self, pipeline):
-    # type: (beam.Pipeline) -> None
-
+  def stop(self, pipeline: beam.Pipeline) -> None:
     """Stops the background source recording of the given pipeline."""
 
     recording_manager = ie.current_env().get_recording_manager(
         pipeline, create_if_absent=True)
     recording_manager.cancel()
 
-  def record(self, pipeline):
-    # type: (beam.Pipeline) -> bool
-
+  def record(self, pipeline: beam.Pipeline) -> bool:
     """Starts a background source recording job for the given pipeline. Returns
     True if the recording job was started.
     """
@@ -405,10 +402,11 @@ class Clusters:
   To configure a pipeline to run on a local FlinkRunner, explicitly set the
   default cluster metadata to None: ib.clusters.set_default_cluster(None).
   """
-  # Explicitly set the Flink version here to ensure compatibility with 2.1
+  # Explicitly set the Flink version here to ensure compatibility with 2.2
   # Dataproc images:
-  # https://cloud.google.com/dataproc/docs/concepts/versioning/dataproc-release-2.1
-  DATAPROC_FLINK_VERSION = '1.15'
+  # https://cloud.google.com/dataproc/docs/concepts/versioning/dataproc-release-2.2
+  # you can manually override this by importing Clusters
+  DATAPROC_FLINK_VERSION = '1.17'
 
   # The minimum worker number to create a Dataproc cluster.
   DATAPROC_MINIMUM_WORKER_NUM = 2
@@ -681,13 +679,11 @@ def watch(watchable):
 
 @progress_indicated
 def show(
-    *pcolls,
-    include_window_info=False,
-    visualize_data=False,
-    n='inf',
-    duration='inf'):
-  # type: (*Union[Dict[Any, PCollection], Iterable[PCollection], PCollection], bool, bool, Union[int, str], Union[int, str]) -> None # noqa: F821
-
+    *pcolls: Union[Dict[Any, PCollection], Iterable[PCollection], PCollection],
+    include_window_info: bool = False,
+    visualize_data: bool = False,
+    n: Union[int, str] = 'inf',
+    duration: Union[int, str] = 'inf'):
   """Shows given PCollections in an interactive exploratory way if used within
   a notebook, or prints a heading sampled data if used within an ipython shell.
   Noop if used in a non-interactive environment.
@@ -880,6 +876,8 @@ def collect(
     n='inf',
     duration='inf',
     include_window_info=False,
+    runner=None,
+    options=None,
     force_compute=False,
     force_tuple=False):
   """Materializes the elements from a PCollection into a Dataframe.
@@ -896,6 +894,9 @@ def collect(
         a string duration. Default 'inf'.
     include_window_info: (optional) if True, appends the windowing information
         to each row. Default False.
+    runner: (optional) the runner with which to compute the results
+    options: (optional) any additional pipeline options to use to compute the
+        results
     force_compute: (optional) if True, forces recomputation rather than using
         cached PCollections
     force_tuple: (optional) if True, return a 1-tuple or results rather than
@@ -969,7 +970,12 @@ def collect(
   uncomputed = set(pcolls) - set(computed.keys())
   if uncomputed:
     recording = recording_manager.record(
-        uncomputed, max_n=n, max_duration=duration, force_compute=force_compute)
+        uncomputed,
+        max_n=n,
+        max_duration=duration,
+        runner=runner,
+        options=options,
+        force_compute=force_compute)
 
     try:
       for pcoll in uncomputed:

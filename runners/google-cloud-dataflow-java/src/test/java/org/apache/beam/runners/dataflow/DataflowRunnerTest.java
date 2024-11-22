@@ -77,6 +77,7 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.Serializable;
+import java.io.Writer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -1156,6 +1157,19 @@ public class DataflowRunnerTest implements Serializable {
   }
 
   @Test
+  public void testReplaceGcsFilesWithLocalFilesEmptyList() {
+    List<String> filesToStage = Collections.emptyList();
+    List<String> processedFiles = DataflowRunner.replaceGcsFilesWithLocalFiles(filesToStage);
+    assertTrue(processedFiles.isEmpty());
+  }
+
+  @Test(expected = RuntimeException.class)
+  public void testReplaceGcsFilesWithLocalFilesIOError() {
+    List<String> filesToStage = Collections.singletonList("gs://non-existent-bucket/file.jar");
+    DataflowRunner.replaceGcsFilesWithLocalFiles(filesToStage);
+  }
+
+  @Test
   public void testNonExistentProfileLocation() throws IOException {
     DataflowPipelineOptions options = buildPipelineOptions();
     options.setSaveProfilesToGcs(NON_EXISTENT_BUCKET);
@@ -1255,8 +1269,8 @@ public class DataflowRunnerTest implements Serializable {
   @Test
   public void testApplySdkEnvironmentOverrides() throws IOException {
     DataflowPipelineOptions options = buildPipelineOptions();
-    String dockerHubPythonContainerUrl = "apache/beam_python3.8_sdk:latest";
-    String gcrPythonContainerUrl = "gcr.io/apache-beam-testing/beam-sdk/beam_python3.8_sdk:latest";
+    String dockerHubPythonContainerUrl = "apache/beam_python3.9_sdk:latest";
+    String gcrPythonContainerUrl = "gcr.io/apache-beam-testing/beam-sdk/beam_python3.9_sdk:latest";
     options.setSdkHarnessContainerImageOverrides(".*python.*," + gcrPythonContainerUrl);
     DataflowRunner runner = DataflowRunner.fromOptions(options);
     RunnerApi.Pipeline pipeline =
@@ -1297,8 +1311,8 @@ public class DataflowRunnerTest implements Serializable {
   @Test
   public void testApplySdkEnvironmentOverridesByDefault() throws IOException {
     DataflowPipelineOptions options = buildPipelineOptions();
-    String dockerHubPythonContainerUrl = "apache/beam_python3.8_sdk:latest";
-    String gcrPythonContainerUrl = "gcr.io/cloud-dataflow/v1beta3/beam_python3.8_sdk:latest";
+    String dockerHubPythonContainerUrl = "apache/beam_python3.9_sdk:latest";
+    String gcrPythonContainerUrl = "gcr.io/cloud-dataflow/v1beta3/beam_python3.9_sdk:latest";
     DataflowRunner runner = DataflowRunner.fromOptions(options);
     RunnerApi.Pipeline pipeline =
         RunnerApi.Pipeline.newBuilder()

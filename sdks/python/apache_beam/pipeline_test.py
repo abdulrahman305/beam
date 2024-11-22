@@ -274,6 +274,16 @@ class PipelineTest(unittest.TestCase):
         'reloading the job state. This is not recommended for '
         'streaming jobs.')
 
+  @mock.patch('logging.info')  # Mock the logging.info function
+  def test_no_wait_until_finish(self, mock_info):
+    with Pipeline(runner='DirectRunner',
+                  options=PipelineOptions(["--no_wait_until_finish"])) as p:
+      _ = p | beam.Create(['test'])
+    mock_info.assert_called_once_with(
+        'Job execution continues without waiting for completion. '
+        'Use "wait_until_finish" in PipelineResult to block until finished.')
+    p.result.wait_until_finish()
+
   def test_auto_unique_labels(self):
 
     opts = PipelineOptions(["--auto_unique_labels"])
@@ -773,7 +783,7 @@ class DoFnTest(unittest.TestCase):
           | Map(lambda _, wv=DoFn.WindowedValueParam: (wv.value, wv.windows)))
       assert_that(
           pcoll,
-          equal_to([(1, [IntervalWindow(0, 5)]), (7, [IntervalWindow(5, 10)])]))
+          equal_to([(1, [IntervalWindow(0, 5)]), (7, [IntervalWindow(5, 10)])]))  # pylint: disable=too-many-function-args
 
   def test_timestamp_param(self):
     class TestDoFn(DoFn):
@@ -1043,7 +1053,7 @@ class RunnerApiTest(unittest.TestCase):
         self.p = p
         return p | beam.Create([None])
 
-      def display_data(self):  # type: () -> dict
+      def display_data(self) -> dict:
         parent_dd = super().display_data()
         parent_dd['p_dd_string'] = DisplayDataItem(
             'p_dd_string_value', label='p_dd_string_label')
@@ -1057,7 +1067,7 @@ class RunnerApiTest(unittest.TestCase):
         self.p = p
         return p | beam.Create([None])
 
-      def display_data(self):  # type: () -> dict
+      def display_data(self) -> dict:
         parent_dd = super().display_data()
         parent_dd['dd_string'] = DisplayDataItem(
             'dd_string_value', label='dd_string_label')
@@ -1173,7 +1183,7 @@ class RunnerApiTest(unittest.TestCase):
 
       @classmethod
       def get_merged_value(
-          cls, outer_value, inner_value):  # type: (bytes, bytes) -> bytes
+          cls, outer_value: bytes, inner_value: bytes) -> bytes:
         return ResourceHint._use_max(outer_value, inner_value)
 
     ResourceHint.register_resource_hint('foo_hint', FooHint)
@@ -1302,7 +1312,7 @@ class RunnerApiTest(unittest.TestCase):
 
       @classmethod
       def get_merged_value(
-          cls, outer_value, inner_value):  # type: (bytes, bytes) -> bytes
+          cls, outer_value: bytes, inner_value: bytes) -> bytes:
         return ResourceHint._use_max(outer_value, inner_value)
 
     ResourceHint.register_resource_hint('foo_hint', FooHint)
