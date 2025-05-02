@@ -16,3 +16,4 @@
 # requirements to compile the pipeline and execute it on Dataflow
 kfp==1.8.13
 google-cloud-aiplatform==1.15
+setuptools>=78.1.1 # not directly required, pinned by Snyk to avoid a vulnerability
