@@ -45,7 +45,7 @@
   "dependencies": {
     "@jupyterlab/application": "^3.1.17",
     "@jupyterlab/launcher": "^3.1.17",
-    "@jupyterlab/mainmenu": "^3.1.17",
+    "@jupyterlab/mainmenu": "^4.0.0",
     "@rmwc/button": "^6.1.3",
     "@rmwc/fab": "^6.1.4",
     "@rmwc/data-table": "^6.0.14",
