@@ -39,3 +39,4 @@ python-snappy  # Optimizes execution of some Beam codepaths.
 scipy
 scikit-learn
 build>=1.0,<2 # tool to build sdist from setup.py in stager.
+requests>=2.32.4 # not directly required, pinned by Snyk to avoid a vulnerability
