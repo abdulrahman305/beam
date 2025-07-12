@@ -18,3 +18,5 @@ apache-beam==2.41.0
 apache-beam[test]==2.41.0
 
 pytz~=2022.2.1
+protobuf>=4.25.8 # not directly required, pinned by Snyk to avoid a vulnerability
+urllib3>=2.5.0 # not directly required, pinned by Snyk to avoid a vulnerability
