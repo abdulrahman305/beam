@@ -23,11 +23,9 @@ import logging
 import os
 import pprint
 import re
+from collections.abc import Iterable
+from collections.abc import Mapping
 from typing import Any
-from typing import Iterable
-from typing import List
-from typing import Mapping
-from typing import Set
 
 import jinja2
 import yaml
@@ -37,6 +35,7 @@ from apache_beam.io.filesystems import FileSystems
 from apache_beam.options.pipeline_options import GoogleCloudOptions
 from apache_beam.transforms.fully_qualified_named_transform import FullyQualifiedNamedTransform
 from apache_beam.yaml import yaml_provider
+from apache_beam.yaml import yaml_utils
 from apache_beam.yaml.yaml_combine import normalize_combine
 from apache_beam.yaml.yaml_mapping import normalize_mapping
 from apache_beam.yaml.yaml_mapping import validate_generic_expressions
@@ -55,12 +54,11 @@ except ImportError:
 
 @functools.lru_cache
 def pipeline_schema(strictness):
-  with open(os.path.join(os.path.dirname(__file__),
-                         'pipeline.schema.yaml')) as yaml_file:
+  with open(yaml_utils.locate_data_file('pipeline.schema.yaml')) as yaml_file:
     pipeline_schema = yaml.safe_load(yaml_file)
   if strictness == 'per_transform':
-    transform_schemas_path = os.path.join(
-        os.path.dirname(__file__), 'transforms.schema.yaml')
+    transform_schemas_path = yaml_utils.locate_data_file(
+        'transforms.schema.yaml')
     if not os.path.exists(transform_schemas_path):
       raise RuntimeError(
           "Please run "
@@ -87,6 +85,12 @@ def validate_against_schema(pipeline, strictness):
     jsonschema.validate(pipeline, pipeline_schema(strictness))
   except jsonschema.ValidationError as exn:
     exn.message += f" around line {_closest_line(pipeline, exn.path)}"
+    # validation message for chain-type transform
+    if (exn.schema_path[-1] == 'not' and
+        exn.schema_path[-2] in ['input', 'output']):
+      exn.message = (
+          f"'{exn.schema_path[-2]}' should not be used "
+          "along with 'chain' type transforms. " + exn.message)
     raise exn
 
 
@@ -163,6 +167,9 @@ class LightweightScope(object):
       else:
         return only_element(candidates)
 
+  def get_transform_spec(self, transform_name_or_id):
+    return self._transforms_by_uuid[self.get_transform_id(transform_name_or_id)]
+
 
 class Scope(LightweightScope):
   """To look up PCollections (typically outputs of prior transforms) by name."""
@@ -177,7 +184,7 @@ class Scope(LightweightScope):
     self.root = root
     self._inputs = inputs
     self.providers = providers
-    self._seen_names: Set[str] = set()
+    self._seen_names: set[str] = set()
     self.input_providers = input_providers
     self._all_followers = None
 
@@ -239,13 +246,26 @@ class Scope(LightweightScope):
       spec = t
     else:
       spec = self._transforms_by_uuid[self.get_transform_id(t)]
-    possible_providers = [
-        p for p in self.providers[spec['type']] if p.available()
-    ]
+    possible_providers = []
+    unavailable_provider_messages = []
+    for p in self.providers[spec['type']]:
+      is_available = p.available()
+      if is_available:
+        possible_providers.append(p)
+      else:
+        reason = getattr(is_available, 'reason', 'no reason given')
+        unavailable_provider_messages.append(
+            f'{p.__class__.__name__} ({reason})')
     if not possible_providers:
+      if unavailable_provider_messages:
+        unavailable_provider_message = (
+            '\nThe following providers were found but not available: ' +
+            '\n'.join(unavailable_provider_messages))
+      else:
+        unavailable_provider_message = ''
       raise ValueError(
-          'No available provider for type %r at %s' %
-          (spec['type'], identify_object(spec)))
+          'No available provider for type %r at %s%s' %
+          (spec['type'], identify_object(spec), unavailable_provider_message))
     # From here on, we have the invariant that possible_providers is not empty.
 
     # Only one possible provider, no need to rank further.
@@ -255,7 +275,7 @@ class Scope(LightweightScope):
     def best_matches(
         possible_providers: Iterable[yaml_provider.Provider],
         adjacent_provider_options: Iterable[Iterable[yaml_provider.Provider]]
-    ) -> List[yaml_provider.Provider]:
+    ) -> list[yaml_provider.Provider]:
       """Given a set of possible providers, and a set of providers for each
       adjacent transform, returns the top possible providers as ranked by
       affinity to the adjacent transforms' providers.
@@ -306,8 +326,43 @@ class Scope(LightweightScope):
 
   # A method on scope as providers may be scoped...
   def create_ptransform(self, spec, input_pcolls):
+    def maybe_with_resource_hints(transform):
+      if 'resource_hints' in spec:
+        return transform.with_resource_hints(
+            **SafeLineLoader.strip_metadata(spec['resource_hints']))
+      else:
+        return transform
+
     if 'type' not in spec:
       raise ValueError(f'Missing transform type: {identify_object(spec)}')
+
+    if spec['type'] == 'composite':
+
+      class _CompositeTransformStub(beam.PTransform):
+        @staticmethod
+        def expand(pcolls):
+          if isinstance(pcolls, beam.PCollection):
+            pcolls = {'input': pcolls}
+          elif isinstance(pcolls, beam.pvalue.PBegin):
+            pcolls = {}
+
+          inner_scope = Scope(
+              self.root,
+              pcolls,
+              spec['transforms'],
+              self.providers,
+              self.input_providers)
+          inner_scope.compute_all()
+          if '__implicit_outputs__' in spec['output']:
+            return inner_scope.get_outputs(
+                spec['output']['__implicit_outputs__'])
+          else:
+            return {
+                key: inner_scope.get_pcollection(value)
+                for (key, value) in spec['output'].items()
+            }
+
+      return maybe_with_resource_hints(_CompositeTransformStub())
 
     if spec['type'] not in self.providers:
       raise ValueError(
@@ -322,6 +377,9 @@ class Scope(LightweightScope):
         if pcoll in providers_by_input
     ]
     provider = self.best_provider(spec, input_providers)
+    extra_dependencies, spec = extract_extra_dependencies(spec)
+    if extra_dependencies:
+      provider = provider.with_extra_dependencies(frozenset(extra_dependencies))
 
     config = SafeLineLoader.strip_metadata(spec.get('config', {}))
     if not isinstance(config, dict):
@@ -342,15 +400,22 @@ class Scope(LightweightScope):
             spec['type'].rsplit('-', 1)[0], config, input_pcolls)
 
       # pylint: disable=undefined-loop-variable
-      ptransform = provider.create_transform(
-          spec['type'], config, self.create_ptransform)
+      ptransform = maybe_with_resource_hints(
+          provider.create_transform(
+              spec['type'],
+              config,
+              lambda config, input_pcolls=input_pcolls: self.create_ptransform(
+                  config, input_pcolls)))
       # TODO(robertwb): Should we have a better API for adding annotations
       # than this?
-      annotations = dict(
-          yaml_type=spec['type'],
-          yaml_args=json.dumps(config),
-          yaml_provider=json.dumps(provider.to_json()),
-          **ptransform.annotations())
+      annotations = {
+          **{
+              'yaml_type': spec['type'],
+              'yaml_args': json.dumps(config),
+              'yaml_provider': json.dumps(provider.to_json())
+          },
+          **ptransform.annotations()
+      }
       ptransform.annotations = lambda: annotations
       original_expand = ptransform.expand
 
@@ -389,7 +454,8 @@ class Scope(LightweightScope):
     if 'name' in spec:
       name = spec['name']
       strictness += 1
-    elif 'ExternalTransform' not in ptransform.label:
+    elif ('ExternalTransform' not in ptransform.label and
+          not ptransform.label.startswith('_')):
       # The label may have interesting information.
       name = ptransform.label
     else:
@@ -466,8 +532,9 @@ def expand_composite_transform(spec, scope):
           for (key, value) in empty_if_explicitly_empty(spec['input']).items()
       },
       spec['transforms'],
+      # TODO(robertwb): Are scoped providers ever used? Worth supporting?
       yaml_provider.merge_providers(
-          yaml_provider.parse_providers(spec.get('providers', [])),
+          yaml_provider.parse_providers('', spec.get('providers', [])),
           scope.providers),
       scope.input_providers)
 
@@ -483,16 +550,21 @@ def expand_composite_transform(spec, scope):
             for (key, value) in spec['output'].items()
         }
 
+  transform = CompositePTransform()
+  if 'resource_hints' in spec:
+    transform = transform.with_resource_hints(
+        **SafeLineLoader.strip_metadata(spec['resource_hints']))
+
   if 'name' not in spec:
     spec['name'] = 'Composite'
   if spec['name'] is None:  # top-level pipeline, don't nest
-    return CompositePTransform.expand(None)
+    return transform.expand(None)
   else:
     _LOGGER.info("Expanding %s ", identify_object(spec))
     return ({
         key: scope.get_pcollection(value)
         for (key, value) in empty_if_explicitly_empty(spec['input']).items()
-    } or scope.root) | scope.unique_name(spec, None) >> CompositePTransform()
+    } or scope.root) | scope.unique_name(spec, None) >> transform
 
 
 def expand_chain_transform(spec, scope):
@@ -513,9 +585,10 @@ def chain_as_composite(spec):
     raise TypeError(
         f"Chain at {identify_object(spec)} missing transforms property.")
   has_explicit_outputs = 'output' in spec
-  composite_spec = normalize_inputs_outputs(tag_explicit_inputs(spec))
+  composite_spec = dict(normalize_inputs_outputs(tag_explicit_inputs(spec)))
   new_transforms = []
   for ix, transform in enumerate(composite_spec['transforms']):
+    transform = dict(transform)
     if any(io in transform for io in ('input', 'output')):
       if (ix == 0 and 'input' in transform and 'output' not in transform and
           is_explicitly_empty(transform['input'])):
@@ -651,6 +724,17 @@ def extract_name(spec):
     return ''
 
 
+def extract_extra_dependencies(spec):
+  deps = spec.get('config', {}).get('dependencies', [])
+  if not deps:
+    return [], spec
+  if not isinstance(deps, list):
+    raise TypeError(f'Dependencies must be a list of strings, got {deps}')
+  return deps, dict(
+      spec,
+      config={k: v for k, v in spec['config'].items() if k != 'dependencies'})
+
+
 def push_windowing_to_roots(spec):
   scope = LightweightScope(spec['transforms'])
   consumed_outputs_by_transform = collections.defaultdict(set)
@@ -717,6 +801,9 @@ def preprocess_windowing(spec):
         'transforms': [modified_spec] + windowing_transforms,
         'input': spec['input'],
         'output': modified_spec['__uuid__'],
+        'config': {
+            'error_handling': spec.get('config', {}).get('error_handling', {})
+        },
         '__line__': spec['__line__'],
         '__uuid__': spec['__uuid__'],
     }
@@ -751,6 +838,9 @@ def preprocess_windowing(spec):
         'name': spec.get('name', None) or spec['type'],
         'transforms': [modified_spec] + windowing_transforms,
         'output': windowed_outputs,
+        'config': {
+            'error_handling': spec.get('config', {}).get('error_handling', {})
+        },
         '__line__': spec['__line__'],
         '__uuid__': spec['__uuid__'],
     }
@@ -771,8 +861,8 @@ def preprocess_flattened_inputs(spec):
       def all_inputs(t):
         for key, values in t.get('input', {}).items():
           if isinstance(values, list):
-            for ix, values in enumerate(values):
-              yield f'{key}{ix}', values
+            for ix, value in enumerate(values):
+              yield f'{key}{ix}', value
           else:
             yield key, values
 
@@ -844,8 +934,10 @@ def lift_config(spec):
   if 'config' not in spec:
     common_params = 'name', 'type', 'input', 'output', 'transforms'
     return {
-        'config': {k: v
-                   for (k, v) in spec.items() if k not in common_params},
+        'config': {
+            k: v
+            for (k, v) in spec.items() if k not in common_params
+        },
         **{
             k: v
             for (k, v) in spec.items()  #
@@ -862,16 +954,17 @@ def ensure_config(spec):
   return spec
 
 
+def apply_phase(phase, spec):
+  spec = phase(spec)
+  if spec['type'] in {'composite', 'chain'} and 'transforms' in spec:
+    spec = dict(
+        spec, transforms=[apply_phase(phase, t) for t in spec['transforms']])
+  return spec
+
+
 def preprocess(spec, verbose=False, known_transforms=None):
   if verbose:
     pprint.pprint(spec)
-
-  def apply(phase, spec):
-    spec = phase(spec)
-    if spec['type'] in {'composite', 'chain'} and 'transforms' in spec:
-      spec = dict(
-          spec, transforms=[apply(phase, t) for t in spec['transforms']])
-    return spec
 
   if known_transforms:
     known_transforms = set(known_transforms).union(['chain', 'composite'])
@@ -935,7 +1028,7 @@ def preprocess(spec, verbose=False, known_transforms=None):
       # lift_config,
       ensure_config,
   ]:
-    spec = apply(phase, spec)
+    spec = apply_phase(phase, spec)
     if verbose:
       print('=' * 20, phase, '=' * 20)
       pprint.pprint(spec)
@@ -1023,7 +1116,12 @@ def expand_pipeline(
     pipeline,
     pipeline_spec,
     providers=None,
-    validate_schema='generic' if jsonschema is not None else None):
+    validate_schema='generic' if jsonschema is not None else None,
+    pipeline_path=''):
+  if isinstance(pipeline, beam.pvalue.PBegin):
+    root = pipeline
+  else:
+    root = beam.pvalue.PBegin(pipeline)
   if isinstance(pipeline_spec, str):
     pipeline_spec = yaml.load(pipeline_spec, Loader=SafeLineLoader)
   # TODO(robertwb): It's unclear whether this gives as good of errors, but
@@ -1034,5 +1132,6 @@ def expand_pipeline(
   return YamlTransform(
       pipeline_as_composite(pipeline_spec['pipeline']),
       yaml_provider.merge_providers(
-          yaml_provider.parse_providers(pipeline_spec.get('providers', [])),
-          providers or {})).expand(beam.pvalue.PBegin(pipeline))
+          yaml_provider.parse_providers(
+              pipeline_path, pipeline_spec.get('providers', [])),
+          providers or {})).expand(root)

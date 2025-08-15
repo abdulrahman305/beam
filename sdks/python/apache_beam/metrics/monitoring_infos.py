@@ -367,8 +367,8 @@ def create_monitoring_info(
         urn=urn, type=type_urn, labels=labels or {}, payload=payload)
   except TypeError as e:
     raise RuntimeError(
-        f'Failed to create MonitoringInfo for urn {urn} type {type} labels ' +
-        '{labels} and payload {payload}') from e
+        f'Failed to create MonitoringInfo for urn {urn} type {type_urn} '
+        f'labels {labels} and payload {payload}') from e
 
 
 def is_counter(monitoring_info_proto):
@@ -495,8 +495,7 @@ def consolidate(metrics, key=to_key):
           return metrics_pb2.MonitoringInfo(
               urn=a.urn,
               type=a.type,
-              labels=dict((label, value) for label,
-                          value in a.labels.items()
+              labels=dict((label, value) for label, value in a.labels.items()
                           if b.labels.get(label) == value),
               payload=combiner(a.payload, b.payload))
 

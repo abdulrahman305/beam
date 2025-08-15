@@ -29,6 +29,7 @@ import time
 import traceback
 import types
 import typing
+from collections import defaultdict
 from itertools import dropwhile
 
 from apache_beam import coders
@@ -393,8 +394,8 @@ def get_function_args_defaults(f):
       parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD
   ]
   args = [
-      name for name,
-      p in signature.parameters.items() if p.kind in _SUPPORTED_ARG_TYPES
+      name for name, p in signature.parameters.items()
+      if p.kind in _SUPPORTED_ARG_TYPES
   ]
   defaults = [
       p.default for p in signature.parameters.values()
@@ -801,12 +802,12 @@ class DoFn(WithTypeHints, HasDisplayData, urns.RunnerApiFn):
           self.process_batch) or typehints.decorators.IOTypeHints.empty()
 
       # Then we deconflict with the typehint from process, if it exists
-      if (process_batch_type_hints.output_types !=
-          typehints.decorators.IOTypeHints.empty().output_types):
-        if (process_type_hints.output_types !=
-            typehints.decorators.IOTypeHints.empty().output_types and
-            process_batch_type_hints.output_types !=
-            process_type_hints.output_types):
+      if (process_batch_type_hints.output_types
+          != typehints.decorators.IOTypeHints.empty().output_types):
+        if (process_type_hints.output_types
+            != typehints.decorators.IOTypeHints.empty().output_types and
+            process_batch_type_hints.output_types
+            != process_type_hints.output_types):
           raise TypeError(
               f"DoFn {self!r} yields element from both process and "
               "process_batch, but they have mismatched output typehints:\n"
@@ -1888,10 +1889,10 @@ class ParDo(PTransformWithSideInputs):
             # transformation is currently irreversible given how
             # remove_objects_from_args and insert_values_in_args
             # are currently implemented.
-            side_inputs={(SIDE_INPUT_PREFIX + '%s') % ix:
-                         si.to_runner_api(context)
-                         for ix,
-                         si in enumerate(self.side_inputs)}))
+            side_inputs={
+                (SIDE_INPUT_PREFIX + '%s') % ix: si.to_runner_api(context)
+                for ix, si in enumerate(self.side_inputs)
+            }))
 
   @staticmethod
   @PTransform.register_urn(
@@ -1909,8 +1910,8 @@ class ParDo(PTransformWithSideInputs):
     # to_runner_api_parameter above).
     indexed_side_inputs = [(
         get_sideinput_index(tag),
-        pvalue.AsSideInput.from_runner_api(si, context)) for tag,
-                           si in pardo_payload.side_inputs.items()]
+        pvalue.AsSideInput.from_runner_api(si, context))
+                           for tag, si in pardo_payload.side_inputs.items()]
     result.side_inputs = [si for _, si in sorted(indexed_side_inputs)]
     return result
 
@@ -2016,7 +2017,7 @@ class StatelessDoFnInfo(DoFnInfo):
     return beam_runner_api_pb2.FunctionSpec(urn=self._urn)
 
 
-def identity(x: T) -> T:
+def identity(x):
   return x
 
 
@@ -2053,6 +2054,7 @@ def FlatMap(fn=identity, *args, **kwargs):  # pylint: disable=invalid-name
 
   pardo = ParDo(CallableWrapperDoFn(fn), *args, **kwargs)
   pardo.label = label
+
   return pardo
 
 
@@ -2680,18 +2682,27 @@ def Filter(fn, *args, **kwargs):  # pylint: disable=invalid-name
 
   # Proxy the type-hint information from the function being wrapped, setting the
   # output type to be the same as the input type.
-  if type_hints.input_types is not None:
+  def has_simple_input_type(th):
+    return (
+        th.input_types is not None and len(th.input_types[0]) == 1 and
+        not th.input_types[1])
+
+  def simple_input_type(th):
+    return th.input_types[0][0] if has_simple_input_type(th) else None
+
+  if type_hints.input_types is not None and simple_input_type(
+      type_hints) is not typehints.Any:
     wrapper = with_input_types(
         *type_hints.input_types[0], **type_hints.input_types[1])(
             wrapper)
-  output_hint = type_hints.simple_output_type(label)
-  if (output_hint is None and get_type_hints(wrapper).input_types and
-      get_type_hints(wrapper).input_types[0]):
-    output_hint = get_type_hints(wrapper).input_types[0][0]
-  if output_hint:
-    wrapper = with_output_types(
-        typehints.Iterable[_strip_output_annotations(output_hint)])(
-            wrapper)
+    output_hint = type_hints.simple_output_type(label)
+    if (output_hint is None and get_type_hints(wrapper).input_types and
+        get_type_hints(wrapper).input_types[0]):
+      output_hint = get_type_hints(wrapper).input_types[0][0]
+    if output_hint:
+      wrapper = with_output_types(
+          typehints.Iterable[_strip_output_annotations(output_hint)])(
+              wrapper)
   # pylint: disable=protected-access
   wrapper._argspec_fn = fn
   # pylint: enable=protected-access
@@ -2917,6 +2928,22 @@ class CombinePerKey(PTransformWithSideInputs):
   Returns:
     A PObject holding the result of the combine operation.
   """
+  def __new__(cls, *args, **kwargs):
+    def has_side_inputs():
+      return (
+          any(isinstance(arg, pvalue.AsSideInput) for arg in args) or
+          any(isinstance(arg, pvalue.AsSideInput) for arg in kwargs.values()))
+
+    if has_side_inputs():
+      # If the CombineFn has deferred side inputs, the python SDK
+      # doesn't implement it.
+      # Use a ParDo-based CombinePerKey instead.
+      from apache_beam.transforms.combiners import \
+        LiftedCombinePerKey
+      combine_fn, *args = args
+      return LiftedCombinePerKey(combine_fn, args, kwargs)
+    return super(CombinePerKey, cls).__new__(cls)
+
   def with_hot_key_fanout(self, fanout):
     """A per-key combine operation like self but with two levels of aggregation.
 
@@ -3054,7 +3081,6 @@ class CombineValues(PTransformWithSideInputs):
 
 class CombineValuesDoFn(DoFn):
   """DoFn for performing per-key Combine transforms."""
-
   def __init__(
       self,
       input_pcoll_type,
@@ -3117,7 +3143,6 @@ class CombineValuesDoFn(DoFn):
 
 
 class _CombinePerKeyWithHotKeyFanout(PTransform):
-
   def __init__(
       self,
       combine_fn,  # type: CombineFn
@@ -3347,7 +3372,6 @@ class GroupBy(PTransform):
   The GroupBy operation can be made into an aggregating operation by invoking
   its `aggregate_field` method.
   """
-
   def __init__(
       self,
       *fields,  # type: typing.Union[str, typing.Callable]
@@ -3487,8 +3511,7 @@ class _GroupAndAggregate(PTransform):
             TupleCombineFn(
                 *[combine_fn for _, combine_fn, __ in self._aggregations]))
         | MapTuple(
-            lambda key,
-            value: _dynamic_named_tuple('Result', result_fields)
+            lambda key, value: _dynamic_named_tuple('Result', result_fields)
             (*(key + value))))
 
 
@@ -3505,7 +3528,6 @@ class Select(PTransform):
 
       pcoll | beam.Map(lambda x: beam.Row(a=x.a, b=foo(x)))
   """
-
   def __init__(
       self,
       *args,  # type: typing.Union[str, typing.Callable]
@@ -3529,8 +3551,10 @@ class Select(PTransform):
     return (
         _MaybePValueWithErrors(pcoll, self._exception_handling_args) | Map(
             lambda x: pvalue.Row(
-                **{name: expr(x)
-                   for name, expr in self._fields}))).as_result()
+                **{
+                    name: expr(x)
+                    for name, expr in self._fields
+                }))).as_result()
 
   def infer_output_type(self, input_type):
     def extract_return_type(expr):
@@ -3586,14 +3610,15 @@ class Partition(PTransformWithSideInputs):
 
 
 class Windowing(object):
-  def __init__(self,
-               windowfn,  # type: WindowFn
-               triggerfn=None,  # type: typing.Optional[TriggerFn]
-               accumulation_mode=None,  # type: typing.Optional[beam_runner_api_pb2.AccumulationMode.Enum.ValueType]
-               timestamp_combiner=None,  # type: typing.Optional[beam_runner_api_pb2.OutputTime.Enum.ValueType]
-               allowed_lateness=0, # type: typing.Union[int, float]
-               environment_id=None, # type: typing.Optional[str]
-               ):
+  def __init__(
+      self,
+      windowfn,  # type: WindowFn
+      triggerfn=None,  # type: typing.Optional[TriggerFn]
+      accumulation_mode=None,  # type: typing.Optional[beam_runner_api_pb2.AccumulationMode.Enum.ValueType]
+      timestamp_combiner=None,  # type: typing.Optional[beam_runner_api_pb2.OutputTime.Enum.ValueType]
+      allowed_lateness=0,  # type: typing.Union[int, float]
+      environment_id=None,  # type: typing.Optional[str]
+  ):
     """Class representing the window strategy.
 
     Args:
@@ -3938,9 +3963,41 @@ class Create(PTransform):
   def infer_output_type(self, unused_input_type):
     if not self.values:
       return typehints.Any
-    return typehints.Union[[
-        trivial_inference.instance_to_type(v) for v in self.values
-    ]]
+
+    # No field data - just use default Union.
+    if not hasattr(self.values[0], 'as_dict'):
+      return typehints.Union[[
+          trivial_inference.instance_to_type(v) for v in self.values
+      ]]
+
+    first_fields = self.values[0].as_dict().keys()
+
+    # Save field types for each field
+    field_types_by_field = defaultdict(set)
+    for row in self.values:
+      row_dict = row.as_dict()
+      for field in first_fields:
+        field_types_by_field[field].add(
+            trivial_inference.instance_to_type(row_dict.get(field)))
+
+    # Determine the appropriate type for each field
+    final_fields = []
+    for field in first_fields:
+      field_types = field_types_by_field[field]
+      non_none_types = {t for t in field_types if t is not type(None)}
+
+      if len(non_none_types) > 1:
+        final_type = typehints.Union[tuple(non_none_types)]
+      elif len(non_none_types) == 1 and len(field_types) == 1:
+        final_type = non_none_types.pop()
+      elif len(non_none_types) == 1 and len(field_types) == 2:
+        final_type = typehints.Optional[non_none_types.pop()]
+      else:
+        raise TypeError("No types found for field %s", field)
+
+      final_fields.append((field, final_type))
+
+    return row_type.RowTypeConstraint.from_fields(final_fields)
 
   def get_output_type(self):
     return (

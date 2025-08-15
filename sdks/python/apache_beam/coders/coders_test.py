@@ -22,6 +22,7 @@ import unittest
 
 import proto
 import pytest
+from google.protobuf import message
 
 import apache_beam as beam
 from apache_beam import typehints
@@ -85,6 +86,23 @@ class ProtoCoderTest(unittest.TestCase):
     self.assertEqual(real_coder.encode(ma), expected_coder.encode(ma))
     self.assertEqual(ma, real_coder.decode(real_coder.encode(ma)))
     self.assertEqual(ma.__class__, real_coder.to_type_hint())
+
+  def test_proto_coder_on_protobuf_message_subclasses(self):
+    # This replicates a scenario where users provide message.Message as the
+    # output typehint for a Map function, even though the actual output messages
+    # are subclasses of message.Message.
+    ma = test_message.MessageA()
+    mb = ma.field2.add()
+    mb.field1 = True
+    ma.field1 = 'hello world'
+
+    coder = coders_registry.get_coder(message.Message)
+    # For messages of google.protobuf.message.Message, the fallback coder will
+    # be FastPrimitivesCoder rather than ProtoCoder.
+    # See the comment on ProtoCoder.from_type_hint() for further details.
+    self.assertEqual(coder, coders.FastPrimitivesCoder())
+
+    self.assertEqual(ma, coder.decode(coder.encode(ma)))
 
 
 class DeterministicProtoCoderTest(unittest.TestCase):
@@ -249,13 +267,19 @@ class NumpyIntAsKeyTest(unittest.TestCase):
     # this type is not supported as the key
     import numpy as np
 
-    with self.assertRaises(TypeError):
+    with self.assertRaisesRegex(Exception, "Unable to deterministically"):
       with TestPipeline() as p:
         indata = p | "Create" >> beam.Create([(a, int(a))
                                               for a in np.arange(3)])
 
         # Apply CombinePerkey to sum values for each key.
         _ = indata | "CombinePerKey" >> beam.CombinePerKey(sum)
+
+
+class WindowedValueCoderTest(unittest.TestCase):
+  def test_to_type_hint(self):
+    coder = coders.WindowedValueCoder(coders.VarIntCoder())
+    self.assertEqual(coder.to_type_hint(), typehints.WindowedValue[int])  # type: ignore[misc]
 
 
 if __name__ == '__main__':
