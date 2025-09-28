@@ -21,19 +21,25 @@
 # pylint: disable=too-many-function-args
 
 import collections
+import hashlib
+import hmac
 import importlib
 import logging
 import math
 import random
 import re
+import string
 import time
 import unittest
 import warnings
 from collections.abc import Mapping
 from datetime import datetime
 
+import mock
 import pytest
 import pytz
+from cryptography.fernet import Fernet
+from cryptography.fernet import InvalidToken
 from parameterized import param
 from parameterized import parameterized
 
@@ -65,6 +71,8 @@ from apache_beam.transforms import window
 from apache_beam.transforms.core import FlatMapTuple
 from apache_beam.transforms.trigger import AfterCount
 from apache_beam.transforms.trigger import Repeatedly
+from apache_beam.transforms.util import GcpSecret
+from apache_beam.transforms.util import Secret
 from apache_beam.transforms.window import FixedWindows
 from apache_beam.transforms.window import GlobalWindow
 from apache_beam.transforms.window import GlobalWindows
@@ -82,6 +90,16 @@ from apache_beam.utils.windowed_value import PANE_INFO_UNKNOWN
 from apache_beam.utils.windowed_value import PaneInfo
 from apache_beam.utils.windowed_value import PaneInfoTiming
 from apache_beam.utils.windowed_value import WindowedValue
+
+try:
+  import dill
+except ImportError:
+  dill = None
+
+try:
+  from google.cloud import secretmanager
+except ImportError:
+  secretmanager = None  # type: ignore[assignment]
 
 warnings.filterwarnings(
     'ignore', category=FutureWarning, module='apache_beam.transform.util_test')
@@ -110,6 +128,13 @@ class _UnpicklableCoder(beam.coders.Coder):
 
   def is_deterministic(self):
     return True
+
+
+def maybe_skip(compat_version):
+  if compat_version and not dill:
+    raise unittest.SkipTest(
+        'Dill dependency not installed which is required for compat_version'
+        ' <= 2.67.0')
 
 
 class CoGroupByKeyTest(unittest.TestCase):
@@ -224,6 +249,134 @@ class CoGroupByKeyTest(unittest.TestCase):
                    lambda k, tagged: (k.value, tagged['x'][0].value * 2)))
       expected = [0, 0, 1, 2, 2, 4, 3, 6, 4, 8]
       assert_that(pcoll, equal_to(expected))
+
+
+class FakeSecret(beam.Secret):
+  def __init__(self, should_throw=False):
+    self._secret = b'aKwI2PmqYFt2p5tNKCyBS5qYmHhHsGZcyZrnZQiQ-uE='
+    self._should_throw = should_throw
+
+  def get_secret_bytes(self) -> bytes:
+    if self._should_throw:
+      raise RuntimeError('Exception retrieving secret')
+    return self._secret
+
+
+class MockNoOpDecrypt(beam.transforms.util._DecryptMessage):
+  def __init__(self, hmac_key_secret, key_coder, value_coder):
+    hmac_key = hmac_key_secret.get_secret_bytes()
+    self.fernet_tester = Fernet(hmac_key)
+    self.known_hmacs = []
+    for key in ['a', 'b', 'c']:
+      self.known_hmacs.append(
+          hmac.new(hmac_key, key_coder.encode(key), hashlib.sha256).digest())
+    super().__init__(hmac_key_secret, key_coder, value_coder)
+
+  def process(self, element):
+    hmac_key, actual_elements = element
+    if hmac_key not in self.known_hmacs:
+      raise ValueError(f'GBK produced unencrypted value {hmac_key}')
+    for e in actual_elements:
+      try:
+        self.fernet_tester.decrypt(e[0], None)
+      except InvalidToken:
+        raise ValueError(f'GBK produced unencrypted value {e[0]}')
+      try:
+        self.fernet_tester.decrypt(e[1], None)
+      except InvalidToken:
+        raise ValueError(f'GBK produced unencrypted value {e[1]}')
+
+    return super().process(element)
+
+
+class GroupByEncryptedKeyTest(unittest.TestCase):
+  def setUp(self):
+    if secretmanager is not None:
+      self.project_id = 'apache-beam-testing'
+      secret_postfix = ''.join(random.choice(string.digits) for _ in range(6))
+      self.secret_id = 'gbek_secret_tests_' + secret_postfix
+      self.client = secretmanager.SecretManagerServiceClient()
+      self.project_path = f'projects/{self.project_id}'
+      self.secret_path = f'{self.project_path}/secrets/{self.secret_id}'
+      try:
+        self.client.get_secret(request={'name': self.secret_path})
+      except Exception:
+        self.client.create_secret(
+            request={
+                'parent': self.project_path,
+                'secret_id': self.secret_id,
+                'secret': {
+                    'replication': {
+                        'automatic': {}
+                    }
+                }
+            })
+        self.client.add_secret_version(
+            request={
+                'parent': self.secret_path,
+                'payload': {
+                    'data': Secret.generate_secret_bytes()
+                }
+            })
+      self.gcp_secret = GcpSecret(f'{self.secret_path}/versions/latest')
+
+  def tearDown(self):
+    if secretmanager is not None:
+      self.client.delete_secret(request={'name': self.secret_path})
+
+  def test_gbek_fake_secret_manager_roundtrips(self):
+    fakeSecret = FakeSecret()
+
+    with TestPipeline() as pipeline:
+      pcoll_1 = pipeline | 'Start 1' >> beam.Create([('a', 1), ('a', 2),
+                                                     ('b', 3), ('c', 4)])
+      result = (pcoll_1) | beam.GroupByEncryptedKey(fakeSecret)
+      assert_that(
+          result, equal_to([('a', ([1, 2])), ('b', ([3])), ('c', ([4]))]))
+
+  @mock.patch('apache_beam.transforms.util._DecryptMessage', MockNoOpDecrypt)
+  def test_gbek_fake_secret_manager_actually_does_encryption(self):
+    fakeSecret = FakeSecret()
+
+    with TestPipeline('FnApiRunner') as pipeline:
+      pcoll_1 = pipeline | 'Start 1' >> beam.Create([('a', 1), ('a', 2),
+                                                     ('b', 3), ('c', 4)])
+      result = (pcoll_1) | beam.GroupByEncryptedKey(fakeSecret)
+      assert_that(
+          result, equal_to([('a', ([1, 2])), ('b', ([3])), ('c', ([4]))]))
+
+  def test_gbek_fake_secret_manager_throws(self):
+    fakeSecret = FakeSecret(True)
+
+    with self.assertRaisesRegex(RuntimeError, r'Exception retrieving secret'):
+      with TestPipeline() as pipeline:
+        pcoll_1 = pipeline | 'Start 1' >> beam.Create([('a', 1), ('a', 2),
+                                                       ('b', 3), ('c', 4)])
+        result = (pcoll_1) | beam.GroupByEncryptedKey(fakeSecret)
+        assert_that(
+            result, equal_to([('a', ([1, 2])), ('b', ([3])), ('c', ([4]))]))
+
+  @unittest.skipIf(secretmanager is None, 'GCP dependencies are not installed')
+  def test_gbek_gcp_secret_manager_roundtrips(self):
+    with TestPipeline() as pipeline:
+      pcoll_1 = pipeline | 'Start 1' >> beam.Create([('a', 1), ('a', 2),
+                                                     ('b', 3), ('c', 4)])
+      result = (pcoll_1) | beam.GroupByEncryptedKey(self.gcp_secret)
+      assert_that(
+          result, equal_to([('a', ([1, 2])), ('b', ([3])), ('c', ([4]))]))
+
+  @unittest.skipIf(secretmanager is None, 'GCP dependencies are not installed')
+  def test_gbek_gcp_secret_manager_throws(self):
+    gcp_secret = GcpSecret('bad_path/versions/latest')
+
+    with self.assertRaisesRegex(RuntimeError,
+                                r'Failed to retrieve secret bytes'):
+      with TestPipeline() as pipeline:
+        pcoll_1 = pipeline | 'Start 1' >> beam.Create([('a', 1), ('a', 2),
+                                                       ('b', 3), ('c', 4)])
+        result = (pcoll_1) | beam.GroupByEncryptedKey(gcp_secret)
+        assert_that(
+            result, equal_to([('a', ([1, 2])), ('b', ([3])), ('c', ([4]))]))
 
 
 class FakeClock(object):
@@ -997,8 +1150,10 @@ class ReshuffleTest(unittest.TestCase):
       param(compat_version=None),
       param(compat_version="2.64.0"),
   ])
+  @pytest.mark.uses_dill
   def test_reshuffle_custom_window_preserves_metadata(self, compat_version):
     """Tests that Reshuffle preserves pane info."""
+    maybe_skip(compat_version)
     element_count = 12
     timestamp_value = timestamp.Timestamp(0)
     l = [
@@ -1098,10 +1253,11 @@ class ReshuffleTest(unittest.TestCase):
       param(compat_version=None),
       param(compat_version="2.64.0"),
   ])
+  @pytest.mark.uses_dill
   def test_reshuffle_default_window_preserves_metadata(self, compat_version):
     """Tests that Reshuffle preserves timestamp, window, and pane info
     metadata."""
-
+    maybe_skip(compat_version)
     no_firing = PaneInfo(
         is_first=True,
         is_last=True,
@@ -2191,6 +2347,68 @@ class WaitOnTest(unittest.TestCase):
           result,
           equal_to([(None, 'result', 6), (None, 'result', 7)]),
           label='result')
+
+
+class CompatCheckTest(unittest.TestCase):
+  def test_is_v1_prior_to_v2(self):
+    test_cases = [
+        # Basic comparison cases
+        ("1.0.0", "2.0.0", True),  # v1 < v2 in major
+        ("2.0.0", "1.0.0", False),  # v1 > v2 in major
+        ("1.1.0", "1.2.0", True),  # v1 < v2 in minor
+        ("1.2.0", "1.1.0", False),  # v1 > v2 in minor
+        ("1.0.1", "1.0.2", True),  # v1 < v2 in patch
+        ("1.0.2", "1.0.1", False),  # v1 > v2 in patch
+
+        # Equal versions
+        ("1.0.0", "1.0.0", False),  # Identical
+        ("0.0.0", "0.0.0", False),  # Both zero
+
+        # Different lengths - shorter vs longer
+        ("1.0", "1.0.0", False),  # Should be equal (1.0 = 1.0.0)
+        ("1.0", "1.0.1", True),  # 1.0.0 < 1.0.1
+        ("1.2", "1.2.0", False),  # Should be equal (1.2 = 1.2.0)
+        ("1.2", "1.2.3", True),  # 1.2.0 < 1.2.3
+        ("2", "2.0.0", False),  # Should be equal (2 = 2.0.0)
+        ("2", "2.0.1", True),  # 2.0.0 < 2.0.1
+        ("1", "2.0", True),  # 1.0.0 < 2.0.0
+
+        # Different lengths - longer vs shorter
+        ("1.0.0", "1.0", False),  # Should be equal
+        ("1.0.1", "1.0", False),  # 1.0.1 > 1.0.0
+        ("1.2.0", "1.2", False),  # Should be equal
+        ("1.2.3", "1.2", False),  # 1.2.3 > 1.2.0
+        ("2.0.0", "2", False),  # Should be equal
+        ("2.0.1", "2", False),  # 2.0.1 > 2.0.0
+        ("2.0", "1", False),  # 2.0.0 > 1.0.0
+
+        # Mixed length comparisons
+        ("1.0", "2.0.0", True),  # 1.0.0 < 2.0.0
+        ("2.0", "1.0.0", False),  # 2.0.0 > 1.0.0
+        ("1", "1.0.1", True),  # 1.0.0 < 1.0.1
+        ("1.1", "1.0.9", False),  # 1.1.0 > 1.0.9
+
+        # Large numbers
+        ("1.9.9", "2.0.0", True),  # 1.9.9 < 2.0.0
+        ("10.0.0", "9.9.9", False),  # 10.0.0 > 9.9.9
+        ("1.10.0", "1.9.0", False),  # 1.10.0 > 1.9.0
+        ("1.2.10", "1.2.9", False),  # 1.2.10 > 1.2.9
+
+        # Sequential versions
+        ("1.0.0", "1.0.1", True),
+        ("1.0.1", "1.0.2", True),
+        ("1.0.9", "1.1.0", True),
+        ("1.9.9", "2.0.0", True),
+
+        # Null/None cases
+        (None, "1.0.0", False),  # v1 is None
+    ]
+
+    for v1, v2, expected in test_cases:
+      self.assertEqual(
+          util.is_v1_prior_to_v2(v1=v1, v2=v2),
+          expected,
+          msg=f"Failed {v1} < {v2} == {expected}")
 
 
 if __name__ == '__main__':

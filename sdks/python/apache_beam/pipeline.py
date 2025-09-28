@@ -76,6 +76,7 @@ from typing import Union
 from google.protobuf import message
 
 from apache_beam import pvalue
+from apache_beam.coders import typecoders
 from apache_beam.internal import pickler
 from apache_beam.io.filesystems import FileSystems
 from apache_beam.options.pipeline_options import CrossLanguageOptions
@@ -83,6 +84,7 @@ from apache_beam.options.pipeline_options import DebugOptions
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.options.pipeline_options import SetupOptions
 from apache_beam.options.pipeline_options import StandardOptions
+from apache_beam.options.pipeline_options import StreamingOptions
 from apache_beam.options.pipeline_options import TypeOptions
 from apache_beam.options.pipeline_options_validator import PipelineOptionsValidator
 from apache_beam.portability import common_urns
@@ -228,6 +230,9 @@ class Pipeline(HasDisplayData):
     if errors:
       raise ValueError(
           'Pipeline has validations errors: \n' + '\n'.join(errors))
+
+    typecoders.registry.update_compatibility_version = self._options.view_as(
+        StreamingOptions).update_compatibility_version
 
     # set default experiments for portable runners
     # (needs to occur prior to pipeline construction)
@@ -575,6 +580,10 @@ class Pipeline(HasDisplayData):
     # type: (Union[bool, str]) -> PipelineResult
 
     """Runs the pipeline. Returns whatever our runner returns after running."""
+    # All pipeline options are finalized at this point.
+    # Call get_all_options to print warnings on invalid options.
+    self.options.get_all_options(
+        retain_unknown_options=True, display_warnings=True)
 
     for error_handler in self._error_handlers:
       error_handler.verify_closed()
@@ -832,10 +841,10 @@ class Pipeline(HasDisplayData):
         self._infer_result_type(transform, tuple(inputs.values()), result)
 
         assert isinstance(result.producer.inputs, tuple)
-        # The DoOutputsTuple adds the PCollection to the outputs when accessed
-        # except for the main tag. Add the main tag here.
         if isinstance(result, pvalue.DoOutputsTuple):
-          current.add_output(result, result._main_tag)
+          for tag, pc in list(result._pcolls.items()):
+            if tag not in current.outputs:
+              current.add_output(pc, tag)
           continue
 
         # If there is already a tag with the same name, increase a counter for
@@ -1221,7 +1230,9 @@ class AppliedPTransform(object):
     self.full_label = full_label
     self.main_inputs = dict(main_inputs or {})
 
-    self.side_inputs = tuple() if transform is None else transform.side_inputs
+    self.side_inputs = (
+        tuple() if transform is None else getattr(
+            transform, 'side_inputs', tuple()))
     self.outputs = {}  # type: Dict[Union[str, int, None], pvalue.PValue]
     self.parts = []  # type: List[AppliedPTransform]
     self.environment_id = environment_id if environment_id else None  # type: Optional[str]
