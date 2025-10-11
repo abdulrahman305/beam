@@ -20,9 +20,9 @@
 // directory.
 module github.com/apache/beam/sdks/v2
 
-go 1.24.0
+go 1.25.0
 
-toolchain go1.24.4
+toolchain go1.25.2
 
 require (
 	cloud.google.com/go/bigquery v1.70.0
@@ -56,7 +56,7 @@ require (
 	github.com/xitongsys/parquet-go-source v0.0.0-20241021075129-b732d2ac9c9b
 	go.mongodb.org/mongo-driver v1.17.4
 	golang.org/x/net v0.45.0
-	golang.org/x/oauth2 v0.31.0
+	golang.org/x/oauth2 v0.32.0
 	golang.org/x/sync v0.17.0
 	golang.org/x/sys v0.37.0
 	golang.org/x/text v0.29.0
@@ -163,7 +163,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20250501225837-2ac532fd4443 // indirect
 	github.com/cpuguy83/dockercfg v0.3.2 // indirect
-	github.com/docker/docker v28.5.0+incompatible // but required to resolve issue docker has with go1.20
+	github.com/docker/docker v28.5.1+incompatible // but required to resolve issue docker has with go1.20
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.2.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
