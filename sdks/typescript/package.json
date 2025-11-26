@@ -2,7 +2,7 @@
   "name": "apache-beam",
   "version": "2.71.0-SNAPSHOT",
   "devDependencies": {
-    "@google-cloud/bigquery": "^5.12.0",
+    "@google-cloud/bigquery": "^7.2.0",
     "@types/mocha": "^9.0.0",
     "@typescript-eslint/eslint-plugin": "^5.24.0",
     "@typescript-eslint/parser": "^5.24.0",
@@ -36,7 +36,7 @@
     "lint": "eslint . --ext .ts"
   },
   "dependencies": {
-    "@google-cloud/pubsub": "^2.19.4",
+    "@google-cloud/pubsub": "^4.0.0",
     "@grpc/grpc-js": "~1.4.6",
     "@protobuf-ts/grpc-transport": "^2.1.0",
     "@protobuf-ts/plugin": "^2.1.0",
