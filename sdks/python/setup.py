@@ -448,12 +448,14 @@ if __name__ == '__main__':
               'pytest>=7.1.2,<9.0',
               'pytest-xdist>=2.5.0,<4',
               'pytest-timeout>=2.1.0,<3',
-              'scikit-learn>=0.20.0',
+              'scikit-learn>=0.20.0,<1.8.0',
               'sqlalchemy>=1.3,<3.0',
               'psycopg2-binary>=2.8.5,<3.0',
               'testcontainers[mysql,kafka,milvus]>=4.0.0,<5.0.0',
               'cryptography>=41.0.2',
-              'hypothesis>5.0.0,<7.0.0',
+              # TODO(https://github.com/apache/beam/issues/36951): need to
+              # further investigate the cause
+              'hypothesis>5.0.0,<6.148.4',
               'virtualenv-clone>=0.5,<1.0',
               'python-tds>=1.16.1',
               'sqlalchemy-pytds>=1.0.2',
